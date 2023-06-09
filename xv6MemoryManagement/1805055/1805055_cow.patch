@@ -1,0 +1,715 @@
+diff --git a/Makefile b/Makefile
+index 39a99d7..653b60f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -117,6 +117,9 @@ mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
+ 
+ UPROGS=\
+ 	$U/_cat\
++	$U/_cowtest_1\
++	$U/_cowtest_2\
++	$U/_cowtest_3\
+ 	$U/_echo\
+ 	$U/_forktest\
+ 	$U/_grep\
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..85d5e27 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -63,6 +63,9 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++void            inc_ref(void *);
++int             multiple_ref(void *pa);
++int             print_mem_size(void);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -168,7 +171,7 @@ int             uvmcopy(pagetable_t, pagetable_t, uint64);
+ void            uvmfree(pagetable_t, uint64);
+ void            uvmunmap(pagetable_t, uint64, uint64, int);
+ void            uvmclear(pagetable_t, uint64);
+-pte_t *         walk(pagetable_t, uint64, int);
++pte_t *         walk(pagetable_t, uint64, int, int);
+ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+@@ -187,3 +190,6 @@ void            virtio_disk_intr(void);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++
++// debug features
++// #define DEBUG_COW
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..4947715 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -18,9 +18,16 @@ struct run {
+   struct run *next;
+ };
+ 
++
++
+ struct {
+   struct spinlock lock;
+   struct run *freelist;
++  // A simple int map to indicate a page's occupency number
++  // 0 : no user
++  // x : x user
++  // delete a page only when only 1 user available
++  int reference[PHYSTOP/PGSIZE];
+ } kmem;
+ 
+ void
+@@ -30,13 +37,23 @@ kinit()
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
++// Only place where free range is called is in kinit, at the beginning of program entry.
++// Free range init the ref of each page to 1, then calls kfree.
++// Kfree then frees the memory and set the ref of that page to 0
+ void
+ freerange(void *pa_start, void *pa_end)
+ {
+   char *p;
+   p = (char*)PGROUNDUP((uint64)pa_start);
+-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
++  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
++
++    acquire(&kmem.lock);
++    kmem.reference[((uint64)p)/PGSIZE] = 1; 
++    release(&kmem.lock);
++
+     kfree(p);
++  }
++    
+ }
+ 
+ // Free the page of physical memory pointed at by pa,
+@@ -51,20 +68,39 @@ kfree(void *pa)
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
+-  // Fill with junk to catch dangling refs.
+-  memset(pa, 1, PGSIZE);
+-
+-  r = (struct run*)pa;
+-
+   acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
++  int ref = kmem.reference[((uint64)pa)/PGSIZE];
+   release(&kmem.lock);
++  
++  // if it's a page pointed to by more than one
++  if (ref <= 1){
++    // usual code... nothing changed accept the reference to 0
++    acquire(&kmem.lock);
++    kmem.reference[((uint64)pa)/PGSIZE] = 0;
++    release(&kmem.lock);
++
++    // entire memory is filled with 0
++    // should not be necessary, but looks clean ig
++    memset(pa, 0, PGSIZE);
++
++    r = (struct run*)pa;
++
++    acquire(&kmem.lock);
++    r->next = kmem.freelist;
++    kmem.freelist = r;
++    release(&kmem.lock);
++  } else {
++    // more than 1 person using the code... just dec ref
++    acquire(&kmem.lock);
++    kmem.reference[((uint64)pa)/PGSIZE]-=1;
++    release(&kmem.lock);
++  }
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+ // Returns a pointer that the kernel can use.
+ // Returns 0 if the memory cannot be allocated.
++// When a kalloc is called, reference of that page is set to 1
+ void *
+ kalloc(void)
+ {
+@@ -76,7 +112,64 @@ kalloc(void)
+     kmem.freelist = r->next;
+   release(&kmem.lock);
+ 
+-  if(r)
++  if(r){
+     memset((char*)r, 5, PGSIZE); // fill with junk
++
++    acquire(&kmem.lock);
++    kmem.reference[((uint64)r)/PGSIZE] = 1;
++    release(&kmem.lock);
++  }
+   return (void*)r;
+ }
++
++// Does what is says.
++// Increases reference of the page, to indicate more than one user.
++void
++inc_ref(void *pa)
++{
++  acquire(&kmem.lock);
++  #ifdef DEBUG_COW
++  //printf("******Before reference: %d\n", kmem.reference[((uint64)pa)/PGSIZE]);
++  #endif
++  kmem.reference[((uint64)pa)/PGSIZE]++;
++  #ifdef DEBUG_COW
++  //printf("******After reference: %d\n", kmem.reference[((uint64)pa)/PGSIZE]);
++  #endif
++  release(&kmem.lock);
++}
++
++// Checks if a page is used more than 1
++int
++multiple_ref(void *pa)
++{
++  int i;
++  acquire(&kmem.lock);
++  i = kmem.reference[((uint64)pa)/PGSIZE];
++  release(&kmem.lock);
++  return (i > 1);
++}
++
++int
++print_mem_size(void)
++{
++  acquire(&kmem.lock); 
++
++  struct run *r;
++  uint64 count = 0;
++
++  // figuring out free memory space
++  // kmem struct has a free list struct
++  // free list struct is a linked list data structure
++  // each element in that list is a possible free page
++  // each page is sized as 4096 byte
++  // so total free memory = element_count * page_size
++  r = kmem.freelist;
++  while(r){
++    r = r->next;
++    count++;
++  }
++  count = count << 12;
++
++  release(&kmem.lock);
++  return count;
++}
+\ No newline at end of file
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..46d1794 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -322,6 +322,10 @@ fork(void)
+   np->state = RUNNABLE;
+   release(&np->lock);
+ 
++  #ifdef DEBUG_COW
++  printf("Debug:: Fork was successful\n");
++  #endif
++
+   return pid;
+ }
+ 
+@@ -354,9 +358,18 @@ exit(int status)
+   // Close all open files.
+   for(int fd = 0; fd < NOFILE; fd++){
+     if(p->ofile[fd]){
++      #ifdef DEBUG_COW
++      //printf("Debug log:: %d file trying to close\n", fd);
++      #endif
++
+       struct file *f = p->ofile[fd];
+       fileclose(f);
+       p->ofile[fd] = 0;
++
++      #ifdef DEBUG_COW
++      //printf("Debug log:: %d file closed succesfully\n", fd);
++      #endif
++
+     }
+   }
+ 
+@@ -380,6 +393,9 @@ exit(int status)
+ 
+   release(&wait_lock);
+ 
++  #ifdef DEBUG_COW
++  printf("Debug log:: pid: %d exit successful\n", p->pid);
++  #endif
+   // Jump into the scheduler, never to return.
+   sched();
+   panic("zombie exit");
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 20a01db..781b181 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -343,6 +343,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // user can access
++#define PTE_L (1L << 8) // lazy page entry
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..c74a0f5 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_msz(void);
++extern uint64 sys_cpy(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_msz]     sys_msz,
++[SYS_cpy]     sys_cpy,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..4c5fd9d 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_msz    22
++#define SYS_cpy    23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..49d18c0 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -89,3 +89,21 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_msz(void)
++{
++  printf("Total Memory Size: %d\n", print_mem_size());
++  return 0;
++}
++
++uint64
++sys_cpy(void)
++{
++  uint64 dva;
++  argaddr(0, &dva);
++  char* c = kalloc();
++  memset((void *)c, 0, PGSIZE);
++  copyout(myproc()->pagetable, dva, c, PGSIZE);
++  return 0;
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 512c850..9b6bf34 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -67,6 +67,76 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
++  } else if(r_scause() == 15){
++    //write flag
++    #ifdef DEBUG_COW
++      printf("Debug Log:: Write trap occured from pid %d\n", p->pid);
++    #endif
++
++    if(r_stval() >= MAXVA){
++      printf("Can't supply that much memory\n");
++      setkilled(p);
++      exit(-1);
++    } 
++
++    pte_t* nonwritable_entry = walk(p->pagetable, r_stval(), 0, 6);
++    uint64 physical_address = PTE2PA(*nonwritable_entry);
++
++    if(*nonwritable_entry & PTE_L){ 
++      // First check to see if it's a cow page
++
++      if(multiple_ref((void *)physical_address)){
++        //Checks if the page is being used more than one
++
++        uint flags = PTE_FLAGS(*nonwritable_entry);
++        flags |= PTE_W;
++        flags &= ~PTE_L;
++        // so the goal is to copy the page and add it to the new processs
++        // we took the flags, and made the new page writable and non lazy
++
++        char *mem;
++        mem = kalloc();
++        // then alloced some memory to attach to the page
++
++        if(mem == 0){
++          // incase the memory we got are fakes... imposters
++          printf("Failled to malloc\n");
++          setkilled(p);
++          exit(-1);
++        }
++
++        // reminders of what is available now
++        // new page means the page the process will get because the process wanted to write things
++        // flags shows what flags value of the new page
++        // mem has the memory for that new page
++        // nonwritable_entry is the "address" of the pagetable entry
++        // physical_address is the "address" that pagetable entry points to
++        // physical_address is the address of non writable memory
++        // we need to move the data that physical_address has to mem
++        // remember, we CANNOT alter anything of physical_address...
++        // memmove(dest, CONST src, sz)
++        memmove(mem, (void *)physical_address, PGSIZE);
++        // now mem has the entire data of physical_adress
++        // physical_adress HAS NOT CHANGED
++        // then we need to tell the process that called this trap,
++        // use the memory of "mem" with the flags of "flags"
++        // remember that nonwritable_entry is the address of the pagetable entry that needs fixing
++        // so go to that address, write mem's address there to point to mem when ever that page entry is needed
++        // also bitwise or the flags to it
++        *nonwritable_entry = PA2PTE(mem) | flags;
++        // physical_address lost an user
++        // should call kfree
++        kfree((void *)physical_address);
++      } else {
++        // if the entry was used only one person, do we need to allocate memory?
++        // No!! just change the flags of that entry so that the program can access it..
++        *nonwritable_entry |= PTE_W;
++        *nonwritable_entry &= ~PTE_L;
++      }
++
++      // supposed to start program, I don't know how trapframe epc work
++      p->trapframe->epc = r_sepc();
++    }
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+@@ -138,6 +208,10 @@ kerneltrap()
+   uint64 sepc = r_sepc();
+   uint64 sstatus = r_sstatus();
+   uint64 scause = r_scause();
++
++  #ifdef DEBUG_COW
++  //printf ("Debug log:: kernel trap occured, sepc: %d, sstatus: %d, scause: %d\n", sepc, sstatus, scause);
++  #endif
+   
+   if((sstatus & SSTATUS_SPP) == 0)
+     panic("kerneltrap: not from supervisor mode");
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 9f69783..397291f 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -83,10 +83,25 @@ kvminithart()
+ //   12..20 -- 9 bits of level-0 index.
+ //    0..11 -- 12 bits of byte offset within the page.
+ pte_t *
+-walk(pagetable_t pagetable, uint64 va, int alloc)
++walk(pagetable_t pagetable, uint64 va, int alloc, int parent_caller)
+ {
++  /*
++    parent_caller_info
++    0 = from walk address
++    1 = from mappage
++    2 = from uvmunmap
++    3 = from uvmcopy
++    4 = from uvmclear
++    5 = from copyout
++    6 = from usertrap
++
++    Sole purpose was to figure out the culprit of the error in usertests.
++    Should've used a DEBUG statement.
++    To late and to afraid to change anything now.
++  */
++  char panicInfo[6] = {'w','a','l','k','0'+parent_caller,0};
+   if(va >= MAXVA)
+-    panic("walk");
++    panic(panicInfo);
+ 
+   for(int level = 2; level > 0; level--) {
+     pte_t *pte = &pagetable[PX(level, va)];
+@@ -114,7 +129,7 @@ walkaddr(pagetable_t pagetable, uint64 va)
+   if(va >= MAXVA)
+     return 0;
+ 
+-  pte = walk(pagetable, va, 0);
++  pte = walk(pagetable, va, 0, 0);
+   if(pte == 0)
+     return 0;
+   if((*pte & PTE_V) == 0)
+@@ -151,7 +166,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+   a = PGROUNDDOWN(va);
+   last = PGROUNDDOWN(va + size - 1);
+   for(;;){
+-    if((pte = walk(pagetable, a, 1)) == 0)
++    if((pte = walk(pagetable, a, 1, 1)) == 0)
+       return -1;
+     if(*pte & PTE_V)
+       panic("mappages: remap");
+@@ -177,7 +192,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+     panic("uvmunmap: not aligned");
+ 
+   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+-    if((pte = walk(pagetable, a, 0)) == 0)
++    if((pte = walk(pagetable, a, 0, 2)) == 0)
+       panic("uvmunmap: walk");
+     if((*pte & PTE_V) == 0)
+       panic("uvmunmap: not mapped");
+@@ -296,32 +311,38 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+   freewalk(pagetable);
+ }
+ 
+-// Given a parent process's page table, copy
+-// its memory into a child's page table.
+-// Copies both the page table and the
+-// physical memory.
++// Given a parent process's page table,
++// map every entry to the child's page table.
++// enable don't write flag.
++// enable cow flag
+ // returns 0 on success, -1 on failure.
+-// frees any allocated pages on failure.
++// remove mapping for the child's page table on failure.
+ int
+ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+ {
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+-  char *mem;
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+-    if((pte = walk(old, i, 0)) == 0)
++    if((pte = walk(old, i, 0, 3)) == 0)
+       panic("uvmcopy: pte should exist");
+     if((*pte & PTE_V) == 0)
+       panic("uvmcopy: page not present");
++
++    // the simplest steps
++    // just change the flags
++    // and map to the pagetable
++    // nothing else
++    *pte &= ~PTE_W;
++    *pte |= PTE_L;
++
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
++
++    inc_ref((void *)pa);
++
++    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+       goto err;
+     }
+   }
+@@ -339,7 +360,7 @@ uvmclear(pagetable_t pagetable, uint64 va)
+ {
+   pte_t *pte;
+   
+-  pte = walk(pagetable, va, 0);
++  pte = walk(pagetable, va, 0, 4);
+   if(pte == 0)
+     panic("uvmclear");
+   *pte &= ~PTE_U;
+@@ -355,6 +376,62 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ 
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
++
++    // my code starts here
++
++    if (va0 >= MAXVA){
++      // corner case handling
++      // too much virtual memory
++      printf("Maximum Virual Address reached\n");
++      return -1;
++    }
++    
++    // so we are copying memory from kerner to user
++    // first get the page table entry from the user where we need to actually copy the stuffs
++    pte_t *pte = walk(pagetable, va0, 0, 5);
++
++    // error check the flags
++    if (pte == 0){
++      printf("Invalid page table entry. Couldn't copy the memory to user program\n");
++      return -1;
++    }
++    if ((*pte & PTE_U) == 0){
++      printf("Page entry isn't accessible via user. Couldn't copy the memory to user program\n");
++      return -1;
++    }
++    if ((*pte & PTE_V) == 0){
++      printf("Invalid page table entry. Couldn't copy the memory to user program\n");
++      return -1;
++    }
++
++    if (*pte & PTE_L){
++      // check to see if the page entry is lazy tagged
++      
++      #ifdef DEBUG_COW
++      printf("Debug Log:: (From Copyout):: COW page called\n");
++      #endif
++
++      uint flags;
++
++      flags = PTE_FLAGS(*pte);
++      flags |= PTE_W; // writeable flag to 1
++      flags &= ~PTE_L; // COW flag to 0
++
++      char* mem;
++      mem = kalloc();
++      
++      if(mem == 0){ 
++          printf("No available memory to allocate");
++          exit(-1);
++      }
++
++      //same code the tedious user trap one... copy paste
++      char* pa = (char*)PTE2PA(*pte);
++      memmove(mem, pa, PGSIZE);
++      *pte = PA2PTE(mem) | flags;
++      kfree(pa);
++    }
++    
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
+       return -1;
+diff --git a/log.txt b/log.txt
+new file mode 100644
+index 0000000..15376fc
+--- /dev/null
++++ b/log.txt
+@@ -0,0 +1,34 @@
++step 1
++
++fork() calls uvmcopy - defined in vm.h.
++uvmcopy is a for loop.
++for every loop:
++    takes a page entry from the old programs page table
++    should turn off write flags of that entry, do that there
++    another flag must be added to indicate cow pages, add in riscv.h. switch the flag entry in uvmcopy function
++    mappage maps the page entry to the new programs pagetable
++
++test for step 1..
++the shell works... but nothing can be written there... anything I types causes write panic
++
++step 2
++
++write trap keeps getting called… r_scause() = f
++take the pagetable of the process… p->pagetable should do the job
++then get the page entry, that caused the error… r_stval() does the job for you
++kalloc a memory and store it in mem
++move the memory to the page entry
++change the page entry flags… writable to 1… cow to 0
++restart the instruction… p->trapframe->epc = r_sepc() does the job
++
++step 3
++
++need to keep reference
++added an array that tracks for every possible memory address
++also kept a spin lock on that array to avoid race condition
++...
++how reference works...
++when uvm copy copies the page entry inc ref
++when write error occurs dec ref
++
++
+diff --git a/user/cowtest_1.c b/user/cowtest_1.c
+new file mode 100644
+index 0000000..d590c85
+--- /dev/null
++++ b/user/cowtest_1.c
+@@ -0,0 +1,13 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++
++int
++main(int argc, char *argv[])
++{
++    int pid = fork();
++    if(pid == 0)
++        printf("Fork was successful\n");
++    exit(0);
++}
+\ No newline at end of file
+diff --git a/user/cowtest_2.c b/user/cowtest_2.c
+new file mode 100644
+index 0000000..8cb4f0a
+--- /dev/null
++++ b/user/cowtest_2.c
+@@ -0,0 +1,11 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++
++int
++main(int argc, char *argv[])
++{
++    msz();
++    exit(0);
++}
+\ No newline at end of file
+diff --git a/user/cowtest_3.c b/user/cowtest_3.c
+new file mode 100644
+index 0000000..685b6fa
+--- /dev/null
++++ b/user/cowtest_3.c
+@@ -0,0 +1,15 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++
++int
++main(int argc, char *argv[])
++{
++    char* mem = sbrk(4096);
++    int pid = fork();
++    if(pid == 0)
++        cpy(mem);
++
++    exit(0);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..85028a9 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int msz(void);
++int cpy(const char*);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..8e0e3c8 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("msz");
++entry("cpy");
